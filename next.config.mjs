@@ -2,16 +2,15 @@
 const nextConfig = {
   reactStrictMode: true,
 
-  // כדי שלא יפול על שגיאות טיפוס/ESLint בזמן deploy
+  // לא לעצור build על טיפוסים/לינט
   typescript: { ignoreBuildErrors: true },
   eslint: { ignoreDuringBuilds: true },
 
   // בלי אופטימיזציית תמונות (אין לנו דומיינים מוגדרים)
   images: { unoptimized: true },
 
-  experimental: {
-    optimizeCss: true,
-  },
+  // אופציונלי: טוב לדפלוימנט קליל
+  // output: 'standalone',
 };
 
 export default nextConfig;
