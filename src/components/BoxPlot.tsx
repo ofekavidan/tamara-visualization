@@ -1,15 +1,14 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import * as React from "react";
 import dynamic from "next/dynamic";
 
-// טעינת Plotly בצד לקוח בלבד
 const Plot = dynamic(() => import("react-plotly.js"), { ssr: false }) as unknown as React.FC<any>;
 
-type RNAClass = "tRFs" | "miRs" | "lncRNAs" | "mRNAs";
-type TimepointKey = "Baseline" | "15" | "30" | "60";
+type RNACategory = "tRFs" | "miRs" | "lncRNAs" | "mRNAs";
+type TimeKey = "Baseline" | "15" | "30" | "60";
 
-const COUNTS_FILE: Record<RNAClass, string> = {
+const COUNTS_FILE: Record<RNACategory, string> = {
   tRFs: "/interactive_boxplot/tRF_countsnorm.csv",
   miRs: "/interactive_boxplot/miR_countsnorm.csv",
   lncRNAs: "/interactive_boxplot/lncRNA_countsnorm.csv",
@@ -17,219 +16,231 @@ const COUNTS_FILE: Record<RNAClass, string> = {
 };
 const METADATA_FILE = "/interactive_boxplot/Metadata.csv";
 
-/** חיבור קלאסים קטן (כמו cn) */
-function cx(...parts: Array<string | undefined | false>) {
-  return parts.filter(Boolean).join(" ");
-}
+type ParsedCSV = { header: string[]; rows: string[][] };
 
-/** פרסור CSV פשוט (מתאים לקבצים: כותרת + ערכים מספריים). */
-function parseCSV(text: string): { header: string[]; rows: string[][] } {
-  // הסרה של BOM אפשרי + \r
-  const clean = text.replace(/^\uFEFF/, "").replace(/\r/g, "");
-  const lines = clean.split("\n").filter((l) => l.trim().length > 0);
-  const header = lines[0].split(",");
-  const rows = lines.slice(1).map((l) => l.split(","));
+function parseCSV(text: string): ParsedCSV {
+  const lines = text.replace(/\r/g, "").split("\n").filter(Boolean);
+  const header = lines[0].split(",").map((s) => s.trim());
+  const rows = lines.slice(1).map((l) => l.split(",").map((s) => s.trim()));
   return { header, rows };
 }
 
-/** בניית מיפוי SampleID -> נקודת זמן מתוך Metadata */
-function buildSampleToTimepoint(metaText: string): Record<string, TimepointKey> {
-  const { header, rows } = parseCSV(metaText);
-  const idxSample = header.indexOf("SampleID");
-  const idxGroup = header.indexOf("Group");
-  const map: Record<string, TimepointKey> = {};
-  if (idxSample === -1 || idxGroup === -1) return map;
-
-  for (const r of rows) {
-    const sample = r[idxSample]?.trim();
-    const group = r[idxGroup]?.trim(); // "Baseline" | "15" | "30" | "60"
-    if (!sample || !group) continue;
-    if (group === "Baseline" || group === "15" || group === "30" || group === "60") {
-      map[sample] = group as TimepointKey;
-    }
-  }
-  return map;
-}
-
-/** שליפת שמות RNA (עמודה ראשונה) + מבנה מלא של הטבלה */
-function prepareCounts(countsText: string): { rnaNames: string[]; header: string[]; rows: string[][] } {
-  const { header, rows } = parseCSV(countsText);
-  return { rnaNames: rows.map((r) => r[0]), header, rows };
-}
-
-interface BoxPlotProps {
-  rnaClass: RNAClass;
+export default function BoxPlot({
+  rnaClass,
+  title = "Boxplot",
+  defaultGene,
+}: {
+  rnaClass: RNACategory;
   title?: string;
-  /** שם ברירת מחדל (אם קיים ברשימה) */
   defaultGene?: string;
-}
+}) {
+  const [allGenes, setAllGenes] = React.useState<string[]>([]);
+  const [gene, setGene] = React.useState<string>(defaultGene ?? "");
+  const [byTime, setByTime] = React.useState<Record<TimeKey, number[]>>({
+    Baseline: [],
+    "15": [],
+    "30": [],
+    "60": [],
+  });
+  const [error, setError] = React.useState<string>("");
 
-export default function BoxPlot({ rnaClass, title = "Boxplot", defaultGene }: BoxPlotProps) {
-  const [metadataMap, setMetadataMap] = useState<Record<string, TimepointKey>>({});
-  const [countsHeader, setCountsHeader] = useState<string[]>([]);
-  const [countsRows, setCountsRows] = useState<string[][]>([]);
-  const [geneList, setGeneList] = useState<string[]>([]);
-  const [query, setQuery] = useState<string>("");
-  const [selectedGene, setSelectedGene] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  // טעינת קבצים
-  useEffect(() => {
+  // טוען CSV + Metadata ומכין את ה-y לכל timepoint
+  React.useEffect(() => {
     let cancelled = false;
+
     async function load() {
+      setError("");
+      setByTime({ Baseline: [], "15": [], "30": [], "60": [] });
+
       try {
-        setError(null);
-
-        const [metaRes, countsRes] = await Promise.all([
-          fetch(METADATA_FILE, { cache: "force-cache" }),
-          fetch(COUNTS_FILE[rnaClass], { cache: "force-cache" }),
+        const [countsText, metaText] = await Promise.all([
+          fetch(COUNTS_FILE[rnaClass]).then((r) => {
+            if (!r.ok) throw new Error("counts CSV not found");
+            return r.text();
+          }),
+          fetch(METADATA_FILE).then((r) => {
+            if (!r.ok) throw new Error("metadata CSV not found");
+            return r.text();
+          }),
         ]);
-        if (!metaRes.ok) throw new Error("Failed loading Metadata.csv");
-        if (!countsRes.ok) throw new Error(`Failed loading counts for ${rnaClass}`);
 
-        const [metaText, countsText] = await Promise.all([metaRes.text(), countsRes.text()]);
-        if (cancelled) return;
+        const counts = parseCSV(countsText);
+        const meta = parseCSV(metaText);
 
-        const metaMap = buildSampleToTimepoint(metaText);
-        const { rnaNames, header, rows } = prepareCounts(countsText);
+        // header: [Gene/Sample?, Sample1, Sample2, ...]
+        const sampleNames = counts.header.slice(1);
+        const geneNames = counts.rows.map((r) => r[0]);
+        const geneIndex = gene
+          ? counts.rows.findIndex((r) => r[0] === gene)
+          : 0;
 
-        setMetadataMap(metaMap);
-        setCountsHeader(header);
-        setCountsRows(rows);
-        setGeneList(rnaNames);
-        const initial = defaultGene && rnaNames.includes(defaultGene) ? defaultGene : rnaNames[0] ?? null;
-        setSelectedGene(initial);
+        const pickedGene = geneIndex >= 0 ? counts.rows[geneIndex][0] : geneNames[0];
+        const valuesRow = geneIndex >= 0 ? counts.rows[geneIndex] : counts.rows[0];
+
+        // Metadata: מחפשים עמודות שמזהות sample ו–timepoint
+        const metaSampleIdx =
+          meta.header.findIndex((h) => /sample/i.test(h)) ?? 0;
+        const metaTimeIdx =
+          meta.header.findIndex((h) => /(time|timepoint|min)/i.test(h)) ?? 1;
+
+        const sample2time: Record<string, TimeKey> = {};
+        meta.rows.forEach((r) => {
+          const s = r[metaSampleIdx];
+          const t = r[metaTimeIdx];
+          let tk: TimeKey = "Baseline";
+          if (/^15/.test(t)) tk = "15";
+          else if (/^30/.test(t)) tk = "30";
+          else if (/^60/.test(t)) tk = "60";
+          else if (/base/i.test(t)) tk = "Baseline";
+          sample2time[s] = tk;
+        });
+
+        // מפזרים ערכים לפי timepoint
+        const grouped: Record<TimeKey, number[]> = {
+          Baseline: [],
+          "15": [],
+          "30": [],
+          "60": [],
+        };
+
+        sampleNames.forEach((sample, i) => {
+          const time = sample2time[sample] ?? "Baseline";
+          const v = Number(valuesRow[i + 1] ?? ""); // +1 כי col0 הוא שם הגן
+          if (!Number.isNaN(v)) grouped[time].push(v);
+        });
+
+        if (!cancelled) {
+          setAllGenes(geneNames);
+          setGene(pickedGene);
+          setByTime(grouped);
+        }
       } catch (e: any) {
-        if (!cancelled) setError(e?.message || "Failed to load data");
+        if (!cancelled) {
+          console.error(e);
+          setError(
+            "Could not load CSVs. Expecting files in public/interactive_boxplot/*.csv"
+          );
+        }
       }
     }
+
     load();
     return () => {
       cancelled = true;
     };
-  }, [rnaClass, defaultGene]);
+    // נריץ בכל פעם שמשתנים class/gene
+  }, [rnaClass, gene]);
 
-  // סינון לחיפוש
-  const filteredGenes = useMemo(() => {
-    if (!query) return geneList.slice(0, 200);
-    const q = query.toLowerCase();
-    return geneList.filter((g) => g.toLowerCase().includes(q)).slice(0, 200);
-  }, [geneList, query]);
+  const mean = (arr: number[]) =>
+    arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
 
-  // חלוקה לערכי ביטוי לפי נקודת זמן
-  const byTimepoint = useMemo(() => {
-    const empty = { Baseline: [], "15": [], "30": [], "60": [] } as Record<TimepointKey, number[]>;
-    if (!selectedGene || countsHeader.length === 0 || countsRows.length === 0) return empty;
-
-    const row = countsRows.find((r) => r[0] === selectedGene);
-    if (!row) return empty;
-
-    const res: Record<TimepointKey, number[]> = { Baseline: [], "15": [], "30": [], "60": [] };
-    for (let i = 1; i < countsHeader.length; i++) {
-      const sample = countsHeader[i];
-      const tp = metadataMap[sample];
-      if (!tp) continue;
-      const raw = row[i];
-      const v = raw === undefined || raw === "" ? NaN : Number(raw);
-      if (Number.isFinite(v)) res[tp].push(v);
-    }
-    return res;
-  }, [selectedGene, countsHeader, countsRows, metadataMap]);
-
-  // קו חציון בין הנקודות
-  const medianLine = useMemo(() => {
-    const order: TimepointKey[] = ["Baseline", "15", "30", "60"];
-    return order.map((tp) => {
-      const arr = byTimepoint[tp];
-      if (!arr || arr.length === 0) return null;
-      const sorted = [...arr].sort((a, b) => a - b);
-      const mid = Math.floor(sorted.length / 2);
-      return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-    });
-  }, [byTimepoint]);
+  const means = [
+    mean(byTime.Baseline),
+    mean(byTime["15"]),
+    mean(byTime["30"]),
+    mean(byTime["60"]),
+  ];
 
   return (
-    <section className="w-full">
-      <h3 className="text-2xl md:text-3xl font-semibold tracking-tight mb-4">{title}</h3>
+    <section className="w-full mt-10">
+      <h3 className="text-center text-2xl font-extrabold mb-4">{title}</h3>
 
-      {/* חיפוש + בחירה */}
-      <div className="mb-4 flex flex-col md:flex-row gap-3">
-        <div className="flex-1">
-          <label className="block text-sm text-neutral-600 mb-1">Search a {rnaClass.slice(0, -1)} name</label>
-          <input
-            className="w-full rounded-lg border px-3 py-2"
-            placeholder="Type to filter…"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-          />
-        </div>
-
-        <div className="flex-1">
-          <label className="block text-sm text-neutral-600 mb-1">{rnaClass} list</label>
-          <select
-            className="w-full rounded-lg border px-3 py-2"
-            value={selectedGene ?? ""}
-            onChange={(e) => setSelectedGene(e.target.value)}
-          >
-            {filteredGenes.map((g) => (
-              <option key={g} value={g}>
-                {g}
-              </option>
-            ))}
-          </select>
-        </div>
+      {/* בוחר גן */}
+      <div className="mb-3 flex items-center gap-3 justify-center">
+        <span className="font-medium">{rnaClass} name:</span>
+        <select
+          className="min-w-[240px] rounded bg-[#2C5F7C] px-3 py-2 text-white"
+          value={gene}
+          onChange={(e) => setGene(e.target.value)}
+        >
+          {allGenes.slice(0, 5000).map((g) => (
+            <option key={g} value={g}>
+              {g}
+            </option>
+          ))}
+        </select>
+        <span className="text-red-500 text-sm">droplist</span>
       </div>
 
       {error ? (
-        <div className="text-red-600 text-sm">{error}</div>
-      ) : !selectedGene ? (
-        <div className="text-neutral-500 text-sm">No gene selected.</div>
+        <div className="text-center text-sm text-red-600">{error}</div>
       ) : (
-        <div className="w-full overflow-x-auto rounded-2xl border bg-white p-2">
-          {/* טיפוסי props של Plot עשויים להקשות ב-TS בפרויקטים מסוימים.
-              משתמשים כאן ב-any באופן נקודתי כדי להבטיח build חלק. */}
-          <Plot
-            data={
-              [
-                { type: "box", name: "0 min", y: byTimepoint["Baseline"], boxpoints: "all", jitter: 0.2, pointpos: -1.8, marker: { size: 6 }, line: { width: 2 } },
-                { type: "box", name: "15 min", y: byTimepoint["15"],       boxpoints: "all", jitter: 0.2, pointpos: -1.8, marker: { size: 6 }, line: { width: 2 } },
-                { type: "box", name: "30 min", y: byTimepoint["30"],       boxpoints: "all", jitter: 0.2, pointpos: -1.8, marker: { size: 6 }, line: { width: 2 } },
-                { type: "box", name: "60 min", y: byTimepoint["60"],       boxpoints: "all", jitter: 0.2, pointpos: -1.8, marker: { size: 6 }, line: { width: 2 } },
+        <div className="rounded-md border-2 border-[#2C5F7C] bg-[#2C5F7C] p-3">
+          <div style={{ height: 360 }}>
+            <Plot
+              data={[
+                // קופסאות לכל timepoint
+                {
+                  type: "box",
+                  name: "0 min",
+                  y: byTime.Baseline,
+                  boxpoints: "all",
+                  jitter: 0.2,
+                  pointpos: -1.8,
+                  marker: { size: 6 },
+                  line: { width: 2 },
+                } as any,
+                {
+                  type: "box",
+                  name: "15 min",
+                  y: byTime["15"],
+                  boxpoints: "all",
+                  jitter: 0.2,
+                  pointpos: -1.8,
+                  marker: { size: 6 },
+                  line: { width: 2 },
+                } as any,
+                {
+                  type: "box",
+                  name: "30 min",
+                  y: byTime["30"],
+                  boxpoints: "all",
+                  jitter: 0.2,
+                  pointpos: -1.8,
+                  marker: { size: 6 },
+                  line: { width: 2 },
+                } as any,
+                {
+                  type: "box",
+                  name: "60 min",
+                  y: byTime["60"],
+                  boxpoints: "all",
+                  jitter: 0.2,
+                  pointpos: -1.8,
+                  marker: { size: 6 },
+                  line: { width: 2 },
+                } as any,
+                // קו ממוצעים בין הקופסאות
                 {
                   type: "scatter",
                   mode: "lines+markers",
-                  name: "Median",
                   x: ["0 min", "15 min", "30 min", "60 min"],
-                  y: medianLine,
+                  y: means,
                   line: { width: 2 },
                   marker: { size: 6 },
-                  hoverinfo: "skip",
+                  name: "mean",
                 },
-              ] as any
-            }
-            layout={
-              {
-                title: `${selectedGene}`,
+              ]}
+              layout={{
+                margin: { l: 40, r: 12, t: 10, b: 48 },
+                paper_bgcolor: "#2C5F7C",
+                plot_bgcolor: "#2C5F7C",
+                font: { color: "white" },
                 xaxis: { title: "timepoint" },
                 yaxis: { title: "DESeq2 normalized count", rangemode: "tozero" },
-                margin: { l: 60, r: 20, t: 40, b: 60 },
                 showlegend: false,
                 autosize: true,
-              } as any
-            }
-            useResizeHandler
-            style={{ width: "100%", height: "520px" }}
-            config={{ displayModeBar: false, responsive: true } as any}
-          />
+              }}
+              config={{ displayModeBar: false, responsive: true }}
+              useResizeHandler
+              style={{ width: "100%", height: "100%" }}
+            />
+          </div>
+          <p className="mt-2 text-center text-xs text-white/80">
+            x-axis: timepoint, y-axis: DESeq2 normalized count
+          </p>
         </div>
       )}
-
-      <p className="text-xs text-neutral-500 mt-2">
-        Expecting files in <code className="font-mono">public/interactive_boxplot/</code>:
-        {" "}
-        <code className="font-mono">{COUNTS_FILE[rnaClass].split("/").pop()}</code> and{" "}
-        <code className="font-mono">Metadata.csv</code>.
-      </p>
     </section>
   );
 }
